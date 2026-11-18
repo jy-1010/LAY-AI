@@ -26,9 +26,14 @@ enum ShopRow { kShopRowStart = kUpgradeCount, kShopRowQuit, kShopRowCount };
 const char* const kShopActionLabels[] = { "START NEXT STAGE", "QUIT TO TITLE" };
 
 const char* const kRowLabels[] = { "FULLSCREEN", "VSYNC", "SHOW FPS", "MASTER VOLUME", "MUSIC VOLUME",
-                                   "SFX VOLUME", "RESET TO DEFAULTS", "BACK" };
+                                   "SFX VOLUME", "KEY CONFIG", "RESET TO DEFAULTS", "BACK" };
 enum SettingsRow { kRowFullscreen, kRowVsync, kRowShowFps, kRowMaster, kRowMusic, kRowSfx,
-                   kRowReset, kRowBack, kRowCount };
+                   kRowKeyConfig, kRowReset, kRowBack, kRowCount };
+
+// キーコンフィグのページ (対象の入力)
+enum KeyPage { kKeyPageKeyboard1, kKeyPageKeyboard2, kKeyPagePad, kKeyPageCount };
+const char* const kKeyPageNames[] = { "KEYBOARD 1", "KEYBOARD 2", "GAMEPAD" };
+static_assert(sizeof(kKeyPageNames) / sizeof(kKeyPageNames[0]) == kKeyPageCount, "キーコンフィグのページ数が合っていない");
 static_assert(sizeof(kRowLabels) / sizeof(kRowLabels[0]) == kRowCount, "設定の項目数が合っていない");
 
 // exe のあるフォルダ (末尾に \ を含む)
@@ -60,6 +65,7 @@ void ItemInfo(Item it, const char*& name, cfg::Rgb& color)
     case Item::Wood:  name = "WOOD";  color = cfg::vis::kTrunkColor;     break;
     case Item::Iron:  name = "IRON";  color = cfg::vis::kIronColor;      break;
     case Item::Track: name = "TRACK"; color = cfg::vis::kTrackItemColor; break;
+    case Item::Dynamite: name = "DYNAMITE"; color = cfg::vis::kDynamiteColor; break;
     default:          name = "EMPTY"; color = cfg::ui::kColorBarOff;     break;
     }
 }
@@ -76,6 +82,10 @@ void CurrentValueText(const Game& g, Upgrade u, char* out, size_t size)
     case Upgrade::CraftSpeed:    snprintf(out, size, "%.1fS", g.CraftSeconds());                             break;
     case Upgrade::TrackCapacity: snprintf(out, size, "%d", g.CrafterCapacity());                             break;
     case Upgrade::CargoCapacity: snprintf(out, size, "%d", g.CargoCapacity());                               break;
+    case Upgrade::TrainBrake:    snprintf(out, size, "SPEED x%.2f", g.BrakeMultiplier());                    break;
+    case Upgrade::CollectorWagon: snprintf(out, size, "%s", g.HasWagon(Wagon::Collector) ? "OWNED" : "NOT OWNED"); break;
+    case Upgrade::MinerWagon:     snprintf(out, size, "%s", g.HasWagon(Wagon::Miner)     ? "OWNED" : "NOT OWNED"); break;
+    case Upgrade::DynamiteWagon:  snprintf(out, size, "%s", g.HasWagon(Wagon::Dynamite)  ? "OWNED" : "NOT OWNED"); break;
     default:                     out[0] = '\0';                                                             break;
     }
 }
@@ -213,6 +223,7 @@ void App::Enter(Scene s)
         resultTimer_ = 0.0f;
         break;
     case Scene::Settings:
+    case Scene::KeyConfig:
     case Scene::Paused:
     case Scene::Clear:
     case Scene::Shop:
@@ -248,7 +259,7 @@ void App::CloseSettings()
 void App::UpdateBgm()
 {
     Scene effective = scene_;
-    if (scene_ == Scene::Settings) effective = settingsReturn_;      // 設定は開いた元の画面の曲を続ける
+    if (scene_ == Scene::Settings || scene_ == Scene::KeyConfig) effective = settingsReturn_;   // 設定は開いた元の画面の曲を続ける
     switch (effective) {
     case Scene::Title:
     case Scene::Shop:     audio_.PlayBgm(Bgm::Menu); break;
@@ -311,6 +322,10 @@ void App::Update(float dt, float realDt)
         if (canInput) UpdateSettings(mi);
         break;
     }
+    case Scene::KeyConfig:
+        if (settingsReturn_ == Scene::Title) UpdateDemoCamera(dt);
+        UpdateKeyConfig(dt, canInput);
+        break;
     case Scene::Playing:
         UpdatePlaying(dt, canInput);
         break;
@@ -352,7 +367,7 @@ void App::UpdatePlaying(float dt, bool canInput)
 {
     Input in[Game::MaxPlayers];
     bool pauseRequested = false;
-    input_.Update(hwnd_, game_, in, pauseRequested);    // 毎フレーム呼ぶ (参加/退出の判定を含む)
+    input_.Update(hwnd_, game_, settings_.keys, in, pauseRequested);    // 毎フレーム呼ぶ (参加/退出の判定を含む)
 
     // ポーズ: 操作があった時、またはウィンドウが前面でなくなった時
     if (canInput && game_.GetState() == State::Playing && (pauseRequested || GetForegroundWindow() != hwnd_)) {
@@ -389,6 +404,9 @@ void App::PlayGameEvents()
         case GameEvent::Deny:        audio_.PlaySfx(Sfx::Deny);     break;
         case GameEvent::Drop:        audio_.PlaySfx(Sfx::Drop);     break;
         case GameEvent::Smash:       audio_.PlaySfx(Sfx::Smash);    break;
+        case GameEvent::Collect:     audio_.PlaySfx(Sfx::Collect);  break;
+        case GameEvent::Explosion:   audio_.PlaySfx(Sfx::Explosion); break;
+        case GameEvent::BrakeCrystal: audio_.PlaySfx(Sfx::Brake);   break;
         case GameEvent::Pushed:      audio_.PlaySfx(Sfx::Pushed);   break;
         case GameEvent::Respawn:     audio_.PlaySfx(Sfx::Respawn);  break;
         case GameEvent::RushStart:   audio_.PlaySfx(Sfx::Rush);     break;
@@ -445,6 +463,15 @@ void App::UpdateSettings(const MenuInput& mi)
     case kRowMaster:     stepVolume(settings_.masterVolume); break;
     case kRowMusic:      stepVolume(settings_.musicVolume);  break;
     case kRowSfx:        stepVolume(settings_.sfxVolume);    break;
+    case kRowKeyConfig:
+        if (mi.confirm) {                                                   // キーコンフィグ画面へ
+            audio_.PlaySfx(Sfx::Confirm);
+            keyPage_ = kKeyPageKeyboard1;
+            waitingKey_ = false;
+            GoTo(Scene::KeyConfig);
+            return;
+        }
+        break;
     case kRowReset:
         if (mi.confirm) { settings_.ResetToDefaults(); changed = true; }
         break;
@@ -455,6 +482,83 @@ void App::UpdateSettings(const MenuInput& mi)
     if (changed) {
         ApplySettings();
         audio_.PlaySfx(Sfx::Select);                    // 変更後の音量で確認音を鳴らす
+    }
+}
+
+// ---- キーコンフィグ: 左右で対象の入力を切り替え、項目を決定すると「次に押したキー」を割り当てる ----
+void App::CloseKeyConfig()
+{
+    settings_.Save(settingsPath_);
+    waitingKey_ = false;
+    GoTo(Scene::Settings);
+    cursor_ = kRowKeyConfig;                                                // 開いた項目にカーソルを戻す
+}
+
+void App::UpdateKeyConfig(float dt, bool canInput)
+{
+    keyMessageTimer_ = std::max(0.0f, keyMessageTimer_ - dt);
+    const bool padPage = (keyPage_ == kKeyPagePad);
+    const int actionRows = padPage ? kPadActionCount : kKeyActionCount;    // 割り当てられる操作の数
+    const int rowCount = actionRows + 2;                                   // + RESET + BACK
+    KeyBindings& kb = settings_.keys;
+
+    // ---- キー入力待ち: 次に押されたキー / ボタンを割り当てる (Esc で取りやめ) ----
+    if (waitingKey_) {
+        int vk = 0;
+        unsigned button = 0;
+        if (input_.CaptureKey(hwnd_, vk)) {
+            if (vk == VK_ESCAPE) {
+                waitingKey_ = false;
+                audio_.PlaySfx(Sfx::Back);
+            } else if (!padPage) {
+                if (IsReservedKey(vk)) {                                    // 固定のキーは使えない
+                    keyMessage_ = "THAT KEY IS RESERVED";
+                    keyMessageTimer_ = ui::kKeyMessageSeconds;
+                    audio_.PlaySfx(Sfx::Deny);
+                } else {
+                    int* keys = kb.keyboard[keyPage_];
+                    for (int act = 0; act < kKeyActionCount; ++act)         // 同じキーを使っている別の操作と入れ替える
+                        if (act != cursor_ && keys[act] == vk) { keys[act] = keys[cursor_]; break; }
+                    keys[cursor_] = vk;
+                    waitingKey_ = false;
+                    audio_.PlaySfx(Sfx::Confirm);
+                }
+            }
+        }
+        if (waitingKey_ && padPage && input_.CapturePadButton(button)) {
+            for (int act = 0; act < kPadActionCount; ++act)
+                if (act != cursor_ && kb.padButton[act] == button) { kb.padButton[act] = kb.padButton[cursor_]; break; }
+            kb.padButton[cursor_] = button;
+            waitingKey_ = false;
+            audio_.PlaySfx(Sfx::Confirm);
+        }
+        return;                                                             // 待ち中はメニュー操作を読まない (押したキーを取りこぼさないため)
+    }
+
+    const MenuInput mi = input_.PollMenu(hwnd_, dt);
+    if (!canInput) return;
+    if (mi.cancel) { audio_.PlaySfx(Sfx::Back); CloseKeyConfig(); return; }
+
+    MoveCursor(mi, rowCount);
+    const int dir = (mi.right ? 1 : 0) - (mi.left ? 1 : 0);                // 左右: キーボード1 → キーボード2 → パッド
+    if (dir != 0) {
+        keyPage_ = (keyPage_ + dir + kKeyPageCount) % kKeyPageCount;
+        const int newActionRows = (keyPage_ == kKeyPagePad) ? kPadActionCount : kKeyActionCount;
+        cursor_ = std::min(cursor_, newActionRows + 1);                     // ページによって行数が違うので、はみ出さないように
+        audio_.PlaySfx(Sfx::Select);
+        return;
+    }
+    if (!mi.confirm) return;
+
+    if (cursor_ < actionRows) {                                             // 操作を選んだ → 入力待ちへ
+        waitingKey_ = true;
+        audio_.PlaySfx(Sfx::Confirm);
+    } else if (cursor_ == actionRows) {                                     // RESET: キー配置を全て初期値へ
+        kb.ResetToDefaults();
+        audio_.PlaySfx(Sfx::Confirm);
+    } else {                                                                // BACK
+        audio_.PlaySfx(Sfx::Back);
+        CloseKeyConfig();
     }
 }
 
@@ -513,6 +617,7 @@ void App::Render()
     switch (scene_) {
     case Scene::Title:    DrawTitleUi();         break;
     case Scene::Settings: DrawSettingsUi();      break;
+    case Scene::KeyConfig: DrawKeyConfigUi();    break;
     case Scene::Playing:  DrawPlayingUi();       break;
     case Scene::Paused:   DrawPausedUi();        break;
     case Scene::Clear:    DrawResultUi(true);    break;
@@ -558,7 +663,7 @@ void App::DrawTitleUi()
 
     DrawMenu(kTitleItems, kTitleItemCount, ui::kMenuTopY);
 
-    ui_.TextCenter(r_, "1P: WASD E Q    2P: ARROWS ENTER RSHIFT    PAD: STICK A X",
+    ui_.TextCenter(r_, "KEYS AND PAD BUTTONS CAN BE CHANGED IN SETTINGS > KEY CONFIG",
                    ui::kTitleHint1Y, ui::kTitleHintPx, ToColor(ui::kColorGray));
     ui_.TextCenter(r_, "UP TO 4 PLAYERS    THE DEVICE YOU START WITH BECOMES 1P",
                    ui::kTitleHint2Y, ui::kTitleHintPx, ToColor(ui::kColorGray));
@@ -603,6 +708,23 @@ void App::DrawPlayingUi()
              game_.Tracks(), game_.CrafterCapacity(), game_.TrainSpeed(), game_.Bolts());
     ui_.Text(r_, buf, ui::kHudX, ui::kHudLine2Y, ui::kHudLine2Px, ToColor(ui::kColorGray));
 
+    // 列車の状態: 減速中 (ブレーキ結晶 / 橋) とダイナマイトの本数
+    {
+        char status[kTextBufferSize] = "";
+        size_t used = 0;
+        if (game_.SlowSeconds() > 0.0f)
+            used += snprintf(status + used, sizeof(status) - used, "BRAKE %dS  ", (int)ceilf(game_.SlowSeconds()));
+        if (game_.OnBridge())
+            used += snprintf(status + used, sizeof(status) - used, "BRIDGE (SLOW)  ");
+        if (game_.HasWagon(Wagon::Dynamite))
+            used += snprintf(status + used, sizeof(status) - used, "DYNAMITE:%d/%d", game_.DynamiteStock(), cfg::kDynamiteCapacity);
+        if (used > 0) {
+            const bool slowed = game_.SlowSeconds() > 0.0f || game_.OnBridge();
+            ui_.Text(r_, status, ui::kHudX, ui::kHudLine3Y, ui::kHudLine3Px,
+                     ToColor(slowed ? ui::kColorCyan : ui::kColorGray));
+        }
+    }
+
     // プレイヤーごとの持ち物: [プレイヤー色] P1  [持ち物の色] WOOD x2/3
     float rowY = ui::kHudPlayerTopY;
     for (int i = 0; i < Game::MaxPlayers; ++i) {
@@ -629,18 +751,76 @@ void App::DrawPlayingUi()
         rowY += ui::kHudPlayerStep;
     }
 
-    // 操作のヒント (画面下。下の行から順に積む)
-    const char* const hints[] = {
-        "E / ENTER / A: PICK UP (ITEM, GROUND), DEPOSIT TO CARGO, TAKE TRACKS",
-        "Q / RSHIFT / X: PLACE TRACK, BUILD BRIDGE (HOLD WOOD)",
-        "F / RCTRL / B: DROP HELD ITEM    PAUSE: ESC / START",
-        "JOIN: E / ENTER / PAD A",
-    };
-    const int hintCount = (int)(sizeof(hints) / sizeof(hints[0]));
+    // 操作のヒント (画面下。今のキー配置を表示する。下の行から順に積む)
+    const KeyBindings& kb = settings_.keys;
+    const int kA = (int)KeyAction::Action, kP = (int)KeyAction::Place, kD = (int)KeyAction::Drop;
+    char hints[4][kTextBufferSize];
+    snprintf(hints[0], kTextBufferSize, "ACTION: %s / %s / PAD %s   (PICK UP, DEPOSIT, TAKE)",
+             KeyName(kb.keyboard[0][kA]).c_str(), KeyName(kb.keyboard[1][kA]).c_str(), PadButtonName(kb.padButton[0]).c_str());
+    snprintf(hints[1], kTextBufferSize, "PLACE: %s / %s / PAD %s   (TRACK, BRIDGE, DYNAMITE)",
+             KeyName(kb.keyboard[0][kP]).c_str(), KeyName(kb.keyboard[1][kP]).c_str(), PadButtonName(kb.padButton[1]).c_str());
+    snprintf(hints[2], kTextBufferSize, "DROP: %s / %s / PAD %s     PAUSE: ESC / START",
+             KeyName(kb.keyboard[0][kD]).c_str(), KeyName(kb.keyboard[1][kD]).c_str(), PadButtonName(kb.padButton[2]).c_str());
+    snprintf(hints[3], kTextBufferSize, "JOIN: ACTION OR PLACE KEY, PAD A     (KEYS: SETTINGS > KEY CONFIG)");
+    const int hintCount = 4;
     for (int i = 0; i < hintCount; ++i) {
         const float y = ui_.Height() - ui::kHudBottomMargin - ui::kHudHintStep * (float)(hintCount - 1 - i);
         ui_.Text(r_, hints[i], ui::kHudX, y, ui::kHudLine2Px, ToColor(ui::kColorGray));
     }
+}
+
+// キーコンフィグ: 上に 対象の入力 (3種類) のタブ、下に 操作ごとの割り当て
+void App::DrawKeyConfigUi()
+{
+    ui_.Rect(r_, 0, 0, ui_.Width(), ui_.Height(), ToColor(ui::kSettingsDim), ui::kZDim);
+    ui_.TextCenter(r_, "KEY CONFIG", ui::kKeyTitleY, ui::kKeyTitlePx, ToColor(ui::kColorGold));
+
+    // タブ (選んでいる入力だけ金色)
+    float totalW = ui::kKeyTabGap * (float)(kKeyPageCount - 1);
+    for (int i = 0; i < kKeyPageCount; ++i) totalW += ui_.TextWidth(kKeyPageNames[i], ui::kKeyTabPx);
+    float tabX = (ui_.Width() - totalW) * cfg::kHalf;
+    for (int i = 0; i < kKeyPageCount; ++i) {
+        ui_.Text(r_, kKeyPageNames[i], tabX, ui::kKeyTabY, ui::kKeyTabPx,
+                 ToColor(i == keyPage_ ? ui::kColorGold : ui::kColorBarOff));
+        tabX += ui_.TextWidth(kKeyPageNames[i], ui::kKeyTabPx) + ui::kKeyTabGap;
+    }
+
+    // 操作の一覧
+    const bool padPage = (keyPage_ == kKeyPagePad);
+    const int actionRows = padPage ? kPadActionCount : kKeyActionCount;
+    const KeyBindings& kb = settings_.keys;
+    const float panelX = (ui_.Width() - ui::kKeyPanelWidth) * cfg::kHalf;
+    const float px = ui::kKeyTextPx;
+
+    for (int row = 0; row < actionRows + 2; ++row) {
+        const float y = ui::kKeyRowTopY + (float)row * ui::kKeyRowStep;
+        const bool selected = (row == cursor_);
+        const XMFLOAT4 color = ToColor(selected ? ui::kColorGold : ui::kColorWhite);
+        if (selected) ui_.Text(r_, ">", panelX - ui::kGlyphAdvance * px, y, px, color);
+
+        if (row < actionRows) {
+            const KeyAction action = padPage ? (KeyAction)((int)KeyAction::Action + row) : (KeyAction)row;
+            ui_.Text(r_, KeyActionName(action), panelX, y, px, color);
+
+            std::string value = padPage ? PadButtonName(kb.padButton[row]) : KeyName(kb.keyboard[keyPage_][row]);
+            if (waitingKey_ && selected) {                                   // 入力待ちは点滅
+                value = padPage ? "PRESS A BUTTON..." : "PRESS A KEY...";
+                if (!BlinkOn(time_)) value.clear();
+            }
+            ui_.Text(r_, value.c_str(), panelX + ui::kKeyValueOffset, y, px, color);
+        } else {
+            ui_.Text(r_, row == actionRows ? "RESET TO DEFAULTS" : "BACK", panelX, y, px, color);
+        }
+    }
+
+    // メッセージ / ヒント
+    if (keyMessageTimer_ > 0.0f)
+        ui_.TextCenter(r_, keyMessage_, ui::kKeyMessageY, ui::kHintPx, ToColor(ui::kColorRed));
+    else
+        ui_.TextCenter(r_, "ESC, P, R, T, BACKSPACE AND DELETE ARE RESERVED (ESC WHILE WAITING = CANCEL)",
+                       ui::kKeyMessageY, ui::kHintPx, ToColor(ui::kColorGray));
+    ui_.TextCenter(r_, "UP / DOWN: SELECT   LEFT / RIGHT: DEVICE   ENTER: CHANGE   ESC: BACK",
+                   ui::kKeyHintY, ui::kHintPx, ToColor(ui::kColorGray));
 }
 
 void App::DrawPausedUi()
@@ -712,8 +892,10 @@ void App::DrawShopUi()
 
     for (int i = 0; i < kUpgradeCount; ++i) {
         const UpgradeInfo& info = kUpgradeInfo[i];
-        if (i == 0 || info.forTrain != kUpgradeInfo[i - 1].forTrain) {          // プレイヤー / 列車 の見出し
-            ui_.Text(r_, info.forTrain ? "TRAIN" : "PLAYERS", panelX, y, ui::kShopHeaderPx, ToColor(ui::kColorGreen));
+        if (i == 0 || info.kind != kUpgradeInfo[i - 1].kind) {                  // プレイヤー / 列車 / 車両 の見出し
+            const char* header = (info.kind == UpgradeKind::Player) ? "PLAYERS"
+                               : (info.kind == UpgradeKind::Train)  ? "TRAIN" : "WAGONS (HIGH PRICE)";
+            ui_.Text(r_, header, panelX, y, ui::kShopHeaderPx, ToColor(ui::kColorGreen));
             y += ui::kShopRowStep;
         }
         const Upgrade u = (Upgrade)i;
@@ -725,7 +907,8 @@ void App::DrawShopUi()
 
         // レベルバー (1マス = 1レベル)
         const int level = game_.UpgradeLevel(u);
-        const cfg::Rgb& on = info.forTrain ? ui::kColorGreen : ui::kColorGold;
+        const cfg::Rgb& on = (info.kind == UpgradeKind::Player) ? ui::kColorGold
+                           : (info.kind == UpgradeKind::Train)  ? ui::kColorGreen : ui::kColorCyan;
         for (int k = 0; k < info.maxLevel; ++k)
             ui_.Rect(r_, panelX + ui::kShopBarOffset + (float)k * (ui::kShopCellW + ui::kShopCellGap), y,
                      ui::kShopCellW, ui::kShopCellH, ToColor(k < level ? on : ui::kColorBarOff), ui::kZText);
@@ -733,7 +916,8 @@ void App::DrawShopUi()
         // 値段: 買えれば白 / ボルト不足なら赤 / 最大レベルなら MAX
         const int cost = game_.UpgradeCost(u);
         if (cost < 0) {
-            ui_.Text(r_, "MAX", panelX + ui::kShopCostOffset, y, px, ToColor(ui::kColorGreen));
+            ui_.Text(r_, info.kind == UpgradeKind::Wagon ? "OWNED" : "MAX", panelX + ui::kShopCostOffset, y, px,
+                     ToColor(ui::kColorGreen));
         } else {
             snprintf(buf, sizeof(buf), "COST %d", cost);
             ui_.Text(r_, buf, panelX + ui::kShopCostOffset, y, px,

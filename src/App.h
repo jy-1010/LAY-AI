@@ -26,7 +26,7 @@ public:
     const std::wstring& LastError() const { return err_; }
 
 private:
-    enum class Scene { Title, Settings, Playing, Paused, Clear, Shop, GameOver };
+    enum class Scene { Title, Settings, KeyConfig, Playing, Paused, Clear, Shop, GameOver };
     enum class Fade  { None, Out, In };         // Out = 暗転中, In = 明転中
     // Playing の始め方: 最初から / 次のステージ / 今のステージをやり直す
     enum class StartMode { New, Next, Retry };
@@ -50,6 +50,8 @@ private:
     void UpdateSettings(const MenuInput& mi);
     void UpdateResult(const MenuInput& mi);
     void UpdateShop(const MenuInput& mi);       // ステージクリア後の強化ショップ
+    void UpdateKeyConfig(float dt, bool canInput);   // キーコンフィグ (キー入力待ちを含む)
+    void CloseKeyConfig();                      // 設定を保存して設定画面へ戻る
     void MoveCursor(const MenuInput& mi, int count);   // 上下でカーソルを動かす (端はループ)
     void PlayGameEvents();                      // ゲーム内の出来事を効果音にする
 
@@ -64,6 +66,7 @@ private:
     void DrawSettingsUi();
     void DrawResultUi(bool clear);
     void DrawShopUi();
+    void DrawKeyConfigUi();
     void DrawMenu(const char* const* items, int count, float topY);
     void DrawVolumeBar(float x, float y, int value, bool selected);
 
@@ -99,6 +102,12 @@ private:
     RECT   windowRect_ = {};
     float  fpsTimer_ = 0.0f, fps_ = 0.0f;
     int    fpsFrames_ = 0;
+
+    // キーコンフィグ
+    int   keyPage_ = 0;                         // 0 = キーボード1, 1 = キーボード2, 2 = パッド
+    bool  waitingKey_ = false;                  // 「次に押したキー / ボタンを割り当てる」待ち
+    float keyMessageTimer_ = 0.0f;              // 「そのキーは使えません」を出している残り時間
+    const char* keyMessage_ = "";
 
     std::wstring err_;
 };

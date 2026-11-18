@@ -228,6 +228,21 @@ void Game::ScatterBolts()
     }
 }
 
+// ブレーキ結晶: 拾うと列車が一時的に遅くなる。草地にランダムに置く (ボルトと同じマスには置かない)
+void Game::ScatterCrystals()
+{
+    crystals_.clear();
+    const int minX = cfg::kResourceMinX, maxX = cfg::kResourceMaxX;
+    for (int attempt = 0; attempt < cfg::kBoltMaxAttempts && (int)crystals_.size() < cfg::kCrystalCount; ++attempt) {
+        const IVec2 c = { minX + (int)(Rand() % (maxX - minX + 1)), (int)(Rand() % H) };
+        if (map_[c.z][c.x] != Tile::Grass) continue;
+        bool taken = false;
+        for (const IVec2& b : boltItems_) if (b.x == c.x && b.z == c.z) { taken = true; break; }
+        for (const IVec2& o : crystals_)  if (o.x == c.x && o.z == c.z) { taken = true; break; }
+        if (!taken) crystals_.push_back(c);
+    }
+}
+
 void Game::BuildStage()
 {
     ClearMap();
@@ -251,6 +266,7 @@ void Game::BuildStage()
 
     ScatterResources();
     ScatterBolts();
+    ScatterCrystals();
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +280,7 @@ void Game::Reset(uint32_t seed)
     boltsCollected_ = 0;
     for (int& level : upgradeLevel_) level = 0;                      // 強化も最初から
     cargoWood_ = cargoIron_ = 0;                                     // 最初からなので貨物も空
+    dynamiteStock_ = 0;
     for (Player& p : players_) p.held = HeldItem();                  // 誰も何も持っていない
     StartStage(seed);
 }
@@ -281,6 +298,7 @@ void Game::RestartStage(uint32_t seed)
     boltsCollected_ = boltsCollectedAtStageStart_;
     cargoWood_ = cargoWoodAtStageStart_;
     cargoIron_ = cargoIronAtStageStart_;
+    dynamiteStock_ = dynamiteAtStageStart_;
     for (int i = 0; i < MaxPlayers; ++i) players_[i].held = heldAtStageStart_[i];
     StartStage(seed);
 }
@@ -304,6 +322,11 @@ void Game::StartStage(uint32_t seed)
         players_[i].face = { 1, 0 };
         players_[i].pushed = false;
     }
+    RebuildTrain();                                                  // 買った車両を連結する
+    explosions_.clear();
+    slowTimer_ = 0;
+    collectTimer_ = mineTimer_ = dynamiteTimer_ = 0;
+    for (Player& pl : players_) pl.noPickupTimer = 0;
     crafterTracks_ = cfg::kInitialTracks;                            // レール作成車両には毎ステージ決まった数の線路が入っている
     craftTimer_ = 0;
     groundItems_.clear();                                            // 落ちている物は前のステージのもの
@@ -311,6 +334,7 @@ void Game::StartStage(uint32_t seed)
     boltsCollectedAtStageStart_ = boltsCollected_;
     cargoWoodAtStageStart_ = cargoWood_;
     cargoIronAtStageStart_ = cargoIron_;
+    dynamiteAtStageStart_ = dynamiteStock_;
     for (int i = 0; i < MaxPlayers; ++i) heldAtStageStart_[i] = players_[i].held;
     trainPos_ = cfg::kInitialTrainPos;
     rushSpeed_ = 0;
@@ -394,7 +418,7 @@ bool Game::CanPlace(IVec2 c) const
     return std::abs(end.x - c.x) + std::abs(end.z - c.z) == 1;       // 上下左右のどれかで隣接
 }
 
-// プレイヤーが近づいたボルトを拾う
+// プレイヤーが近づいたボルトと、ブレーキ結晶を拾う
 void Game::CollectBolts(const Player& p)
 {
     const float r2 = cfg::kBoltPickupRadius * cfg::kBoltPickupRadius;
@@ -408,6 +432,18 @@ void Game::CollectBolts(const Player& p)
             Emit(GameEvent::Bolt);
         } else {
             ++b;
+        }
+    }
+    // ブレーキ結晶: 拾うと列車が一定時間 遅くなる
+    for (size_t c = 0; c < crystals_.size(); ) {
+        const float dx = (float)crystals_[c].x - p.px, dz = (float)crystals_[c].z - p.pz;
+        if (dx * dx + dz * dz <= r2) {
+            crystals_[c] = crystals_.back();
+            crystals_.pop_back();
+            slowTimer_ = cfg::kCrystalSlowSeconds;
+            Emit(GameEvent::BrakeCrystal);
+        } else {
+            ++c;
         }
     }
 }
@@ -425,12 +461,51 @@ int Game::Score() const
     return scoreBase_ + StageRailScore() + boltsCollected_ * cfg::kScorePerBolt;    // 消費したボルトもスコアには数える
 }
 
-// 通常の速さ: 少しずつ加速する
-// ゴールラッシュ中 (線路がゴール駅まで繋がった後): 一気に加速してゴールへ向かう
+// 列車の通常の速さ: 時間とともに加速し、遅くする手段を反映する
+//   ・TRAIN BRAKE の強化        : 常に遅い
+//   ・ブレーキ結晶を拾った後    : 一定時間 遅い
+//   ・機関車が橋を渡っている間  : 徐行
+float Game::BaseSpeed() const
+{
+    float speed = std::min(trainMaxSpeed_, trainStartSpeed_ + cfg::kTrainAccel * time_);
+    speed *= BrakeMultiplier();
+    if (slowTimer_ > 0.0f) speed *= cfg::kCrystalSlowFactor;
+    if (OnBridge())        speed *= cfg::kBridgeSlowFactor;
+    return speed;
+}
+
+// ゴールラッシュ中 (線路がゴール駅まで繋がった後) は、一気に加速してゴールへ向かう
 float Game::TrainSpeed() const
 {
-    const float base = std::min(trainMaxSpeed_, trainStartSpeed_ + cfg::kTrainAccel * time_);
+    const float base = BaseSpeed();
     return IsRushing() ? std::max(base, rushSpeed_) : base;
+}
+
+// 機関車の一番近い線路のマスが橋か
+bool Game::OnBridge() const
+{
+    if (path_.empty()) return false;
+    const int index = std::min(std::max((int)(trainPos_ + cfg::kHalf), 0), (int)path_.size() - 1);
+    const IVec2& c = path_[index];
+    return map_[c.z][c.x] == Tile::Bridge;
+}
+
+bool Game::HasWagon(Wagon w) const
+{
+    for (Wagon t : train_) if (t == w) return true;
+    return false;
+}
+
+// 買った車両に合わせて train_ を作り直す。最初の3両 (機関車・貨物・レール作成) は固定で、その後ろに追加車両が並ぶ
+void Game::RebuildTrain()
+{
+    train_.clear();
+    train_.push_back(Wagon::Engine);
+    train_.push_back(Wagon::Cargo);
+    train_.push_back(Wagon::Crafter);
+    if (upgradeLevel_[(int)Upgrade::CollectorWagon] > 0) train_.push_back(Wagon::Collector);
+    if (upgradeLevel_[(int)Upgrade::MinerWagon]     > 0) train_.push_back(Wagon::Miner);
+    if (upgradeLevel_[(int)Upgrade::DynamiteWagon]  > 0) train_.push_back(Wagon::Dynamite);
 }
 
 bool Game::IsRushing() const
@@ -453,26 +528,26 @@ void Game::TrainPoint(float t, float& x, float& z, float& yaw) const
     yaw = atan2f((float)(b.x - a.x), (float)(b.z - a.z));            // 進行方向を向く (Y軸回転)
 }
 
-// ---------------------------------------------------------------------------
-// 列車の当たり判定
-// ---------------------------------------------------------------------------
-// 全車両 (機関車 + 貨車) の判定用の箱を作る。大きさは見た目 (vis) と同じ + 余白
-void Game::GetCars(CarBox cars[cfg::kTrainCarCount]) const
+// 全車両 (機関車 + 貨車) の判定用の箱を作って、車両数を返す。大きさは見た目 (vis) と同じ + 余白
+int Game::GetCars(CarBox cars[cfg::kMaxCars]) const
 {
-    for (int i = 0; i < cfg::kTrainCarCount; ++i) {
+    const int count = std::min((int)train_.size(), cfg::kMaxCars);
+    for (int i = 0; i < count; ++i) {
         CarBox& c = cars[i];
         TrainPoint(trainPos_ - cfg::kWagonSpacing * i, c.x, c.z, c.yaw);       // i = 0 が機関車
+        c.type = train_[i];
         const float w = (i == 0) ? vis::kEngineWidth  : vis::kWagonWidth;
         const float l = (i == 0) ? vis::kEngineLength : vis::kWagonLength;
         c.halfW = w * cfg::kHalf + cfg::kTrainCollisionPad;
         c.halfL = l * cfg::kHalf + cfg::kTrainCollisionPad;
     }
+    return count;
 }
 
 // どれかの車両に円 (x, z, radius) がめり込んでいれば、その車両を返す。無ければ nullptr
-const Game::CarBox* Game::FirstCarOverlap(const CarBox cars[cfg::kTrainCarCount], float x, float z, float radius) const
+const Game::CarBox* Game::FirstCarOverlap(const CarBox* cars, int count, float x, float z, float radius) const
 {
-    for (int i = 0; i < cfg::kTrainCarCount; ++i) {
+    for (int i = 0; i < count; ++i) {
         float ox, oz;
         if (CirclePushOutOfBox(x, z, radius, cars[i].x, cars[i].z, cars[i].yaw, cars[i].halfW, cars[i].halfL, ox, oz))
             return &cars[i];
@@ -486,8 +561,8 @@ const Game::CarBox* Game::FirstCarOverlap(const CarBox cars[cfg::kTrainCarCount]
 //   どこにも逃げられない (挟まれた) 時だけリスポーンさせる。
 void Game::ResolveTrainCollisions()
 {
-    CarBox cars[cfg::kTrainCarCount];
-    GetCars(cars);
+    CarBox cars[cfg::kMaxCars];
+    const int count = GetCars(cars);
     // 浮動小数の誤差で「押し出した直後なのにまだ重なっている」と誤判定しないよう、判定を少し甘くする
     const float testR = cfg::kPlayerRadius - cfg::kPushOutTolerance;
 
@@ -497,7 +572,7 @@ void Game::ResolveTrainCollisions()
 
         bool moved = false;                                          // このフレームに押し出されたか
         for (int iter = 0; iter < cfg::kPushIterations; ++iter) {
-            const CarBox* hit = FirstCarOverlap(cars, p.px, p.pz, testR);
+            const CarBox* hit = FirstCarOverlap(cars, count, p.px, p.pz, testR);
             if (!hit) break;                                         // もう重なっていない
 
             float bestDx = 0.0f, bestDz = 0.0f;
@@ -506,7 +581,7 @@ void Game::ResolveTrainCollisions()
             // 候補 (dx, dz) 分だけ動いた先が空いていれば、一番短いものを覚えておく
             auto consider = [&](float dx, float dz) {
                 const float nx = p.px + dx, nz = p.pz + dz;
-                if (Blocked(nx, nz) || FirstCarOverlap(cars, nx, nz, testR)) return;
+                if (Blocked(nx, nz) || FirstCarOverlap(cars, count, nx, nz, testR)) return;
                 const float len2 = dx * dx + dz * dz;
                 if (len2 < bestLen2) { bestLen2 = len2; bestDx = dx; bestDz = dz; found = true; }
             };
@@ -541,7 +616,7 @@ void Game::ResolveTrainCollisions()
         }
 
         // 繰り返しても外へ出られなかった (壁や水との間に挟まれた)
-        if (FirstCarOverlap(cars, p.px, p.pz, testR) || Blocked(p.px, p.pz)) RespawnPlayer(i);
+        if (FirstCarOverlap(cars, count, p.px, p.pz, testR) || Blocked(p.px, p.pz)) RespawnPlayer(i);
 
         if (moved && !p.pushed) Emit(GameEvent::Pushed);             // 押され始めた時だけ知らせる
         p.pushed = moved;
@@ -549,7 +624,7 @@ void Game::ResolveTrainCollisions()
 }
 
 // リスポーン先を探す: 中心 (cx, cz) から minDist 以上 maxDist 以内で、歩けて、列車とも重ならないマスをランダムに選ぶ
-bool Game::PickRespawnSpot(const CarBox cars[cfg::kTrainCarCount], float cx, float cz,
+bool Game::PickRespawnSpot(const CarBox* cars, int count, float cx, float cz,
                            float minDist, float maxDist, float& outX, float& outZ)
 {
     const float testR = cfg::kPlayerRadius - cfg::kPushOutTolerance;
@@ -567,7 +642,7 @@ bool Game::PickRespawnSpot(const CarBox cars[cfg::kTrainCarCount], float cx, flo
             const float x = (float)cell.x, z = (float)cell.z;        // マスの中心
             const float d = sqrtf((x - cx) * (x - cx) + (z - cz) * (z - cz));
             if (d < minDist || d > maxR) continue;
-            if (Blocked(x, z) || FirstCarOverlap(cars, x, z, testR)) continue;
+            if (Blocked(x, z) || FirstCarOverlap(cars, count, x, z, testR)) continue;
             spots.push_back({ x, z });
         }
         if (!spots.empty()) {
@@ -585,8 +660,8 @@ bool Game::PickRespawnSpot(const CarBox cars[cfg::kTrainCarCount], float cx, flo
 void Game::RespawnPlayer(int idx)
 {
     Player& p = players_[idx];
-    CarBox cars[cfg::kTrainCarCount];
-    GetCars(cars);
+    CarBox cars[cfg::kMaxCars];
+    const int count = GetCars(cars);
 
     int others[MaxPlayers], n = 0;                                   // 自分以外の参加者
     for (int j = 0; j < MaxPlayers; ++j) if (j != idx && players_[j].active) others[n++] = j;
@@ -595,9 +670,9 @@ void Game::RespawnPlayer(int idx)
     bool ok;
     if (n > 0) {
         const Player& o = players_[others[Rand() % n]];              // ランダムに選んだ他のプレイヤー
-        ok = PickRespawnSpot(cars, o.px, o.pz, cfg::kRespawnMinDist, cfg::kRespawnMaxDist, x, z);
+        ok = PickRespawnSpot(cars, count, o.px, o.pz, cfg::kRespawnMinDist, cfg::kRespawnMaxDist, x, z);
     } else {
-        ok = PickRespawnSpot(cars, cars[0].x, cars[0].z, 0.0f, cfg::kRespawnTrainRadius, x, z);
+        ok = PickRespawnSpot(cars, count, cars[0].x, cars[0].z, 0.0f, cfg::kRespawnTrainRadius, x, z);
         // 列車の近くはカメラの外かもしれないので、カメラもすぐ追いつかせる
         if (ok) camX_ = std::min(std::max(x, cfg::kCamMinX), (float)W - cfg::kCamEndMargin);
     }
@@ -627,17 +702,19 @@ void Game::TakeOne(Player& p)
     if (--p.held.count <= 0) p.held = HeldItem();                    // 0個になったら手ぶらに戻る
 }
 
-// プレイヤーが向いている先 (中心から kInteractReach 先の点) にある貨車。無ければ 0
-//   貨物車両 = cfg::kStorageWagonIndex, レール作成車両 = cfg::kCrafterWagonIndex (機関車には触れない)
+// プレイヤーが向いている先 (中心から kInteractReach 先の点) にある、触れる貨車の車両番号。無ければ 0
+//   触れるのは 貨物車両 (預ける) / レール作成車両 (線路を取り出す) / ダイナマイト作成車両 (取り出す)。
+//   機関車と、自動で動く 回収・採掘 車両には触れない
 int Game::FacedWagon(const Player& p) const
 {
-    CarBox cars[cfg::kTrainCarCount];
-    GetCars(cars);
+    CarBox cars[cfg::kMaxCars];
+    const int count = GetCars(cars);
     const float probeX = p.px + (float)p.face.x * cfg::kInteractReach;
     const float probeZ = p.pz + (float)p.face.z * cfg::kInteractReach;
 
-    for (int i = cfg::kStorageWagonIndex; i <= cfg::kCrafterWagonIndex; ++i) {
+    for (int i = 1; i < count; ++i) {
         const CarBox& c = cars[i];
+        if (c.type != Wagon::Cargo && c.type != Wagon::Crafter && c.type != Wagon::Dynamite) continue;
         const float fx = sinf(c.yaw), fz = cosf(c.yaw);              // 車両の前方向
         const float rx = fz,          rz = -fx;                      // 車両の右方向
         const float dx = probeX - c.x, dz = probeZ - c.z;
@@ -717,6 +794,7 @@ void Game::DropHeld(Player& p)
 
     AddGroundItem(c, p.held.item, p.held.count);
     p.held = HeldItem();
+    p.noPickupTimer = cfg::kDropPickupCooldown;                      // 置いた直後に自動で拾い直さない
     Emit(GameEvent::Drop);
 }
 
@@ -727,6 +805,11 @@ void Game::PlaceFacing(Player& p)
     if (!InBounds(c)) return;
     Tile& t = map_[c.z][c.x];
 
+    if (t == Tile::HardRock) {                                       // 壊れない岩: ダイナマイトだけが壊せる
+        if (p.held.item == Item::Dynamite) { TakeOne(p); Explode(c); }
+        else                               Emit(GameEvent::Deny);
+        return;
+    }
     if (t == Tile::Water) {
         if (p.held.item == Item::Wood && p.held.count >= cfg::kWoodPerBridge) {
             for (int k = 0; k < cfg::kWoodPerBridge; ++k) TakeOne(p);   // 持っている木を使う
@@ -813,6 +896,7 @@ bool Game::BuyUpgrade(Upgrade u)
     if (!CanBuy(u)) return false;
     bolts_ -= UpgradeCost(u);
     ++upgradeLevel_[(int)u];
+    RebuildTrain();                                                  // 車両を買った時は、すぐ列車に連結する
     return true;
 }
 
@@ -850,6 +934,163 @@ float Game::CraftProgress() const
 {
     return craftTimer_ / CraftSeconds();
 }
+float Game::DynamiteProgress() const
+{
+    return dynamiteTimer_ / cfg::kDynamiteSeconds;
+}
+// TRAIN BRAKE: 1レベルごとに速度が下がる。下がりすぎないよう下限がある
+float Game::BrakeMultiplier() const
+{
+    return std::max(cfg::upgrade::kBrakeMinFactor,
+                    cfg::upgrade::kBaseMultiplier - (float)upgradeLevel_[(int)Upgrade::TrainBrake] * cfg::upgrade::kBrakeStep);
+}
+
+// ---------------------------------------------------------------------------
+// ダイナマイトと、自動で動く車両
+// ---------------------------------------------------------------------------
+// ダイナマイト作成車両からダイナマイトを取り出す (手ぶらか、ダイナマイトを持っていて持てる数に余裕がある時)
+void Game::TakeDynamite(Player& p)
+{
+    if (!CanCarry(p, Item::Dynamite)) { Emit(GameEvent::Deny); return; }
+    const int have = (p.held.item == Item::Dynamite) ? p.held.count : 0;
+    const int moved = std::min(CarryMax() - have, dynamiteStock_);
+    if (moved <= 0) { Emit(GameEvent::Deny); return; }               // まだ出来ていない
+    dynamiteStock_ -= moved;
+    p.held.item = Item::Dynamite;
+    p.held.count = have + moved;
+    Emit(GameEvent::Pickup);
+}
+
+// 爆発: 爆心と、その上下左右の 壊れない岩 を壊す
+void Game::Explode(IVec2 c)
+{
+    auto blast = [&](IVec2 cell) {
+        if (InBounds(cell) && map_[cell.z][cell.x] == Tile::HardRock) map_[cell.z][cell.x] = Tile::Grass;
+    };
+    blast(c);
+    for (const IVec2& d : kNeighbors) blast({ c.x + d.x, c.z + d.z });
+    explosions_.push_back({ c, 0.0f });
+    Emit(GameEvent::Explosion);
+}
+
+// 持っている物と同じ種類が近くに落ちていれば、通りがかりに自動で拾う (手ぶらの時や、別の種類の時は拾わない)
+void Game::AutoPickup(Player& p)
+{
+    if (p.held.item == Item::None || p.noPickupTimer > 0.0f) return;
+    const float r2 = cfg::kAutoPickupRadius * cfg::kAutoPickupRadius;
+    for (size_t i = 0; i < groundItems_.size() && p.held.count < CarryMax(); ) {
+        const GroundItem& g = groundItems_[i];
+        const float dx = (float)g.cell.x - p.px, dz = (float)g.cell.z - p.pz;
+        if (g.stack.item == p.held.item && dx * dx + dz * dz <= r2) {
+            const size_t before = groundItems_.size();
+            PickUpGround(p, (int)i);                                 // 持てるだけ拾う (山が空になれば消える)
+            if (groundItems_.size() == before) ++i;                  // 消えなかった時だけ次へ進む
+        } else {
+            ++i;
+        }
+    }
+}
+
+// 追加車両の自動動作 (購入済みの車両だけ)
+void Game::UpdateWagons(float dt)
+{
+    CarBox cars[cfg::kMaxCars];
+    const int count = GetCars(cars);
+    for (int i = 1; i < count; ++i) {
+        switch (cars[i].type) {
+        case Wagon::Collector: RunCollector(cars[i], dt); break;
+        case Wagon::Miner:     RunMiner(cars[i], dt);     break;
+        case Wagon::Dynamite:  RunDynamiteCrafter(dt);    break;
+        default: break;
+        }
+    }
+}
+
+// 自動回収車両: 範囲内の 落ちている木・鉄 を貨物車両へ、ボルトを所持ボルトへ 一定間隔で回収する
+void Game::RunCollector(const CarBox& car, float dt)
+{
+    collectTimer_ += dt;
+    if (collectTimer_ < cfg::kCollectInterval) return;
+    collectTimer_ = 0.0f;
+
+    const float r2 = cfg::kCollectorRadius * cfg::kCollectorRadius;
+    bool any = false;
+
+    for (size_t i = 0; i < groundItems_.size(); ) {                  // 落ちている 木・鉄 (積載量の範囲で)
+        GroundItem& g = groundItems_[i];
+        const float dx = (float)g.cell.x - car.x, dz = (float)g.cell.z - car.z;
+        const bool resource = (g.stack.item == Item::Wood || g.stack.item == Item::Iron);
+        if (resource && dx * dx + dz * dz <= r2) {
+            int& stock = (g.stack.item == Item::Wood) ? cargoWood_ : cargoIron_;
+            const int moved = std::min(g.stack.count, CargoCapacity() - stock);
+            if (moved > 0) { stock += moved; g.stack.count -= moved; any = true; }
+            if (g.stack.count <= 0) { groundItems_.erase(groundItems_.begin() + i); continue; }
+        }
+        ++i;
+    }
+    for (size_t b = 0; b < boltItems_.size(); ) {                    // ボルト
+        const float dx = (float)boltItems_[b].x - car.x, dz = (float)boltItems_[b].z - car.z;
+        if (dx * dx + dz * dz <= r2) {
+            boltItems_[b] = boltItems_.back();
+            boltItems_.pop_back();
+            ++bolts_;
+            ++boltsCollected_;
+            any = true;
+        } else {
+            ++b;
+        }
+    }
+    if (any) Emit(GameEvent::Collect);
+}
+
+// 周囲採掘車両: 範囲内で一番近い 木・岩 を一定間隔で 1つ採掘して、貨物車両に入れる (積載量が一杯の物は掘らない)
+void Game::RunMiner(const CarBox& car, float dt)
+{
+    mineTimer_ += dt;
+    if (mineTimer_ < cfg::kMineInterval) return;
+    mineTimer_ = 0.0f;
+
+    const float r2 = cfg::kMinerRadius * cfg::kMinerRadius;
+    const int range = (int)ceilf(cfg::kMinerRadius);
+    const int baseX = (int)floorf(car.x + cfg::kHalf), baseZ = (int)floorf(car.z + cfg::kHalf);
+    IVec2 best = { -1, -1 };
+    float bestD2 = std::numeric_limits<float>::max();
+
+    for (int dz = -range; dz <= range; ++dz)
+    for (int dx = -range; dx <= range; ++dx) {
+        const IVec2 cell = { baseX + dx, baseZ + dz };
+        if (!InBounds(cell)) continue;
+        const Tile t = map_[cell.z][cell.x];
+        if (t != Tile::Tree && t != Tile::Rock) continue;
+        const int stock = (t == Tile::Tree) ? cargoWood_ : cargoIron_;
+        if (stock >= CargoCapacity()) continue;                      // 貨物が一杯
+        const float d2 = ((float)cell.x - car.x) * ((float)cell.x - car.x) + ((float)cell.z - car.z) * ((float)cell.z - car.z);
+        if (d2 <= r2 && d2 < bestD2) { bestD2 = d2; best = cell; }
+    }
+    if (best.x < 0) return;                                          // 掘れる物が無い
+
+    Tile& t = map_[best.z][best.x];
+    if (t == Tile::Tree) ++cargoWood_; else ++cargoIron_;
+    t = Tile::Grass;
+    Emit(GameEvent::Harvest);
+}
+
+// ダイナマイト作成車両: 貨物車両の 木 と 鉄 から、一定時間ごとにダイナマイトを1本作る
+void Game::RunDynamiteCrafter(float dt)
+{
+    if (cargoWood_ >= cfg::kDynamiteWood && cargoIron_ >= cfg::kDynamiteIron && dynamiteStock_ < cfg::kDynamiteCapacity) {
+        dynamiteTimer_ += dt;
+        if (dynamiteTimer_ >= cfg::kDynamiteSeconds) {
+            dynamiteTimer_ = 0.0f;
+            cargoWood_ -= cfg::kDynamiteWood;
+            cargoIron_ -= cfg::kDynamiteIron;
+            ++dynamiteStock_;
+            Emit(GameEvent::Craft);
+        }
+    } else {
+        dynamiteTimer_ = 0.0f;                                       // 材料が無い / 満杯の間は進めない
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 更新
@@ -875,6 +1116,10 @@ void Game::Update(float dt, const Input in[MaxPlayers])
 
     if (state_ != State::Playing) return;
     time_ += dt;
+    slowTimer_ = std::max(0.0f, slowTimer_ - dt);                    // ブレーキ結晶の効果が切れていく
+    for (Explosion& e : explosions_) e.age += dt;                    // 爆発の演出
+    explosions_.erase(std::remove_if(explosions_.begin(), explosions_.end(),
+                      [](const Explosion& e) { return e.age >= cfg::kExplosionSeconds; }), explosions_.end());
 
     // --- プレイヤーごとの処理 ---
     for (int i = 0; i < MaxPlayers; ++i) {
@@ -898,13 +1143,22 @@ void Game::Update(float dt, const Input in[MaxPlayers])
         }
 
         CollectBolts(p);
+        p.noPickupTimer = std::max(0.0f, p.noPickupTimer - dt);
+        AutoPickup(p);                                               // 持っている物と同じ落とし物が近くにあれば自動で拾う
 
         // 採取ボタン: 向いている先に貨車があれば 預ける / 取り出す。無ければ 落ちている物 / 木・岩 を拾う
         if (pin.harvest) {
             const int wagon = FacedWagon(p);
-            if (wagon == cfg::kStorageWagonIndex)      DepositToCargo(p);
-            else if (wagon == cfg::kCrafterWagonIndex) TakeTracks(p);
-            else                                       HarvestFacing(p);
+            if (wagon > 0) {
+                switch (train_[wagon]) {
+                case Wagon::Cargo:    DepositToCargo(p); break;
+                case Wagon::Crafter:  TakeTracks(p);     break;
+                case Wagon::Dynamite: TakeDynamite(p);   break;
+                default: break;
+                }
+            } else {
+                HarvestFacing(p);
+            }
         }
 
         // 設置ボタン: 水なら橋 (木を持っている時) / それ以外なら線路 (線路を持っている時)
@@ -928,10 +1182,12 @@ void Game::Update(float dt, const Input in[MaxPlayers])
         craftTimer_ = 0.0f;                                          // 材料が無い / 出来上がりが満杯の間は進めない
     }
 
+    UpdateWagons(dt);                                                // 追加車両 (自動回収 / 採掘 / ダイナマイト作成)
+
     // --- 列車: 線路の上を進み、少しずつ加速する ---
     if (IsRushing() && !rushAnnounced_) { rushAnnounced_ = true; Emit(GameEvent::RushStart); }
     if (IsRushing()) {                                               // 線路がゴールまで繋がった → どんどん加速
-        const float base = std::min(trainMaxSpeed_, trainStartSpeed_ + cfg::kTrainAccel * time_);
+        const float base = BaseSpeed();
         rushSpeed_ = std::min(std::max(rushSpeed_, base) + cfg::kGoalRushAccel * dt, cfg::kGoalRushMaxSpeed);
     }
     const float end = (float)(path_.size() - 1);                     // 線路の終端 (マス番号)
@@ -962,9 +1218,11 @@ void Game::Render(Renderer& r, const Meshes& m) const
     DrawStations(p);
     DrawGroundItems(p);
     DrawBolts(p);
+    DrawCrystals(p);
     DrawTrack(p);
     DrawTrain(p);
     DrawPlayers(p);
+    DrawExplosions(p);
 }
 
 // 地面・水・橋・木・岩・岩の塊・柵
@@ -1118,21 +1376,12 @@ void Game::DrawTrack(GamePainter& p) const
     }
 }
 
-// 列車: 機関車 + 貨物車両 + レール作成車両
-//   貨物車両: 預けられた木 (左列) と 鉄 (右列) を積んで表示する
-//   レール作成車両: 作った線路を積んで表示し、側面の緑のバーで線路を作っている進み具合を示す
+// 列車: 連結されている全車両を、後ろへ順に描く
+//   機関車 / 貨物車両 (木と鉄を積む) / レール作成車両 (線路を積み、緑のバーが進み具合) /
+//   自動回収車両 (回る磁石) / 周囲採掘車両 (回るドリル) / ダイナマイト作成車両 (ダイナマイトを積み、バーが進み具合)
 void Game::DrawTrain(GamePainter& p) const
 {
     float x, z, yaw;
-
-    // 機関車 (車体 + 運転台 + 煙突)
-    TrainPoint(trainPos_, x, z, yaw);
-    p.Cube(Xf(vis::kEngineWidth, vis::kEngineHeight, vis::kEngineLength,
-              0, vis::kEngineY, 0, yaw, x, 0, z), vis::kEngineColor);
-    p.Cube(Xf(vis::kCabWidth, vis::kCabHeight, vis::kCabLength,
-              0, vis::kCabY, vis::kCabZ, yaw, x, 0, z), vis::kCabColor);
-    p.Cube(Xf(vis::kChimneyWidth, vis::kChimneyHeight, vis::kChimneyWidth,
-              0, vis::kChimneyY, vis::kChimneyZ, yaw, x, 0, z), vis::kChimneyColor);
 
     // 積み荷を貨車の上に1列に並べる (最大 kInventoryShowMax 個)
     auto cargoRow = [&](int count, float offsetX, const cfg::Rgb& color) {
@@ -1141,32 +1390,73 @@ void Game::DrawTrain(GamePainter& p) const
                       offsetX, vis::kCargoY, vis::kCargoZStart + vis::kCargoZStep * k,
                       yaw, x, 0, z), color);
     };
+    // 車体の側面に進行バー (進み具合 0..1)
+    auto progressBar = [&](float progress) {
+        p.Cube(Xf(vis::kCraftBarThickness, vis::kCraftBarHeight, vis::kCraftBarLength,         // 土台 (満タンの長さ)
+                  vis::kCraftBarSideX, vis::kCraftBarY, vis::kCraftBarZ0 + vis::kCraftBarLength * cfg::kHalf,
+                  yaw, x, 0, z), vis::kCraftBarBgColor);
+        const float ratio = std::min(std::max(progress, 0.0f), 1.0f);
+        if (ratio > 0.0f) {
+            const float len = vis::kCraftBarLength * ratio;                                    // 進んだぶんだけ塗る
+            p.Cube(Xf(vis::kCraftBarFillThickness, vis::kCraftBarHeight, len,
+                      vis::kCraftBarSideX, vis::kCraftBarY, vis::kCraftBarZ0 + len * cfg::kHalf,
+                      yaw, x, 0, z), vis::kCraftBarColor);
+        }
+    };
+    auto wagonBody = [&](const cfg::Rgb& color) {
+        p.Cube(Xf(vis::kWagonWidth, vis::kWagonHeight, vis::kWagonLength,
+                  0, vis::kWagonY, 0, yaw, x, 0, z), color);
+    };
 
-    // 貨物車両: 木 (左列) と 鉄 (右列)
-    TrainPoint(trainPos_ - cfg::kWagonSpacing * cfg::kStorageWagonIndex, x, z, yaw);
-    p.Cube(Xf(vis::kWagonWidth, vis::kWagonHeight, vis::kWagonLength,
-              0, vis::kWagonY, 0, yaw, x, 0, z), vis::kStorageWagonColor);
-    cargoRow(cargoWood_, -vis::kCargoOffsetX, vis::kTrunkColor);
-    cargoRow(cargoIron_,  vis::kCargoOffsetX, vis::kIronColor);
+    for (int i = 0; i < (int)train_.size(); ++i) {
+        TrainPoint(trainPos_ - cfg::kWagonSpacing * i, x, z, yaw);           // i = 0 が機関車
+        switch (train_[i]) {
+        case Wagon::Engine:                                                  // 車体 + 運転台 + 煙突
+            p.Cube(Xf(vis::kEngineWidth, vis::kEngineHeight, vis::kEngineLength,
+                      0, vis::kEngineY, 0, yaw, x, 0, z), vis::kEngineColor);
+            p.Cube(Xf(vis::kCabWidth, vis::kCabHeight, vis::kCabLength,
+                      0, vis::kCabY, vis::kCabZ, yaw, x, 0, z), vis::kCabColor);
+            p.Cube(Xf(vis::kChimneyWidth, vis::kChimneyHeight, vis::kChimneyWidth,
+                      0, vis::kChimneyY, vis::kChimneyZ, yaw, x, 0, z), vis::kChimneyColor);
+            break;
 
-    // レール作成車両: 出来上がった線路 + 進行バー
-    TrainPoint(trainPos_ - cfg::kWagonSpacing * cfg::kCrafterWagonIndex, x, z, yaw);
-    p.Cube(Xf(vis::kWagonWidth, vis::kWagonHeight, vis::kWagonLength,
-              0, vis::kWagonY, 0, yaw, x, 0, z), vis::kCrafterWagonColor);
-    for (int k = 0; k < std::min(crafterTracks_, cfg::kInventoryShowMax); ++k)
-        p.Cube(Xf(vis::kTrackItemWidth, vis::kTrackItemHeight, vis::kCargoLength,
-                  0, vis::kTrackItemY, vis::kCargoZStart + vis::kCargoZStep * k,
-                  yaw, x, 0, z), vis::kTrackItemColor);
+        case Wagon::Cargo:                                                   // 木 (左列) と 鉄 (右列)
+            wagonBody(vis::kStorageWagonColor);
+            cargoRow(cargoWood_, -vis::kCargoOffsetX, vis::kTrunkColor);
+            cargoRow(cargoIron_,  vis::kCargoOffsetX, vis::kIronColor);
+            break;
 
-    p.Cube(Xf(vis::kCraftBarThickness, vis::kCraftBarHeight, vis::kCraftBarLength,         // バーの土台 (満タンの長さ)
-              vis::kCraftBarSideX, vis::kCraftBarY, vis::kCraftBarZ0 + vis::kCraftBarLength * cfg::kHalf,
-              yaw, x, 0, z), vis::kCraftBarBgColor);
-    const float progress = std::min(std::max(CraftProgress(), 0.0f), 1.0f);
-    if (progress > 0.0f) {
-        const float len = vis::kCraftBarLength * progress;                                 // 進んだぶんだけ塗る
-        p.Cube(Xf(vis::kCraftBarFillThickness, vis::kCraftBarHeight, len,
-                  vis::kCraftBarSideX, vis::kCraftBarY, vis::kCraftBarZ0 + len * cfg::kHalf,
-                  yaw, x, 0, z), vis::kCraftBarColor);
+        case Wagon::Crafter:                                                 // 出来上がった線路 + 進行バー
+            wagonBody(vis::kCrafterWagonColor);
+            for (int k = 0; k < std::min(crafterTracks_, cfg::kInventoryShowMax); ++k)
+                p.Cube(Xf(vis::kTrackItemWidth, vis::kTrackItemHeight, vis::kCargoLength,
+                          0, vis::kTrackItemY, vis::kCargoZStart + vis::kCargoZStep * k,
+                          yaw, x, 0, z), vis::kTrackItemColor);
+            progressBar(CraftProgress());
+            break;
+
+        case Wagon::Collector:                                               // 上で磁石 (六角の円盤) が回る
+            wagonBody(vis::kCollectorWagonColor);
+            p.Hex(Xf(vis::kMagnetSize, vis::kMagnetHeight, vis::kMagnetSize,
+                     0, vis::kMagnetY, 0, animTime_ * anim::kMagnetSpinSpeed, x, 0, z), vis::kMagnetColor);
+            break;
+
+        case Wagon::Miner:                                                   // 上でドリル (四角錐) が回る
+            wagonBody(vis::kMinerWagonColor);
+            p.Pyramid(Xf(vis::kDrillSize, vis::kDrillHeight, vis::kDrillSize,
+                         0, vis::kDrillY, 0, animTime_ * anim::kDrillSpinSpeed, x, 0, z), vis::kDrillColor);
+            break;
+
+        case Wagon::Dynamite:                                                // ダイナマイトの束 + 進行バー
+            wagonBody(vis::kDynamiteWagonColor);
+            for (int k = 0; k < std::min(dynamiteStock_, cfg::kDynamiteCapacity); ++k)
+                for (float side : { -vis::kDynamiteStickOffsetX, vis::kDynamiteStickOffsetX })
+                    p.Cube(Xf(vis::kDynamiteStickWidth, vis::kDynamiteStickWidth, vis::kDynamiteStickLength,
+                              side, vis::kDynamiteStickY, vis::kCargoZStart + vis::kDynamiteStickStep * k,
+                              yaw, x, 0, z), vis::kDynamiteColor);
+            progressBar(DynamiteProgress());
+            break;
+        }
     }
 }
 
@@ -1176,6 +1466,7 @@ static const cfg::Rgb& ItemColor(Item it)
     switch (it) {
     case Item::Wood:  return vis::kTrunkColor;
     case Item::Iron:  return vis::kIronColor;
+    case Item::Dynamite: return vis::kDynamiteColor;
     default:          return vis::kTrackItemColor;     // Item::Track
     }
 }
@@ -1183,7 +1474,7 @@ static const cfg::Rgb& ItemColor(Item it)
 // プレイヤー: 体 + 頭 + 向きの目印 + 頭上の色マーカー + 持っている物。向いている先のハイライトも描く
 void Game::DrawPlayers(GamePainter& p) const
 {
-    CarBox cars[cfg::kTrainCarCount];
+    CarBox cars[cfg::kMaxCars];
     GetCars(cars);
 
     for (int i = 0; i < MaxPlayers; ++i) {
@@ -1196,21 +1487,24 @@ void Game::DrawPlayers(GamePainter& p) const
         const int wagon = FacedWagon(pl);
         if (wagon != 0) {
             // 貨車: 預けられる / 取り出せる時だけ光る (黄)
-            const bool canDeposit = (wagon == cfg::kStorageWagonIndex)
+            const Wagon type = cars[wagon].type;
+            const bool canDeposit = (type == Wagon::Cargo)
                                   && (pl.held.item == Item::Wood || pl.held.item == Item::Iron);
-            const bool canTake = (wagon == cfg::kCrafterWagonIndex) && crafterTracks_ > 0 && CanCarry(pl, Item::Track);
+            const bool canTake = (type == Wagon::Crafter  && crafterTracks_ > 0 && CanCarry(pl, Item::Track))
+                              || (type == Wagon::Dynamite && dynamiteStock_ > 0 && CanCarry(pl, Item::Dynamite));
             if (canDeposit || canTake) {
                 const CarBox& c = cars[wagon];
                 p.Cube(Xf(c.halfW * 2.0f, vis::kHighlightThickness, c.halfL * 2.0f,
                           0, layerY, 0, c.yaw, c.x, 0, c.z), vis::kHighlightHarvestColor);
             }
         } else {
-            // マス: 緑 = 線路を置ける / 水色 = 橋を架けられる / 黄 = 拾える
+            // マス: 緑 = 線路を置ける・ダイナマイトを使える / 水色 = 橋を架けられる / 黄 = 拾える
             const IVec2 c = FaceCell(pl);
             if (InBounds(c)) {
                 const Tile t = map_[c.z][c.x];
                 const cfg::Rgb* mark = nullptr;
                 if (CanPlace(c) && pl.held.item == Item::Track)                  mark = &vis::kHighlightPlaceColor;
+                else if (t == Tile::HardRock && pl.held.item == Item::Dynamite)  mark = &vis::kHighlightPlaceColor;
                 else if (t == Tile::Water && pl.held.item == Item::Wood
                          && pl.held.count >= cfg::kWoodPerBridge)                mark = &vis::kHighlightBridgeColor;
                 else if (FindGroundItem(c) >= 0 && CanCarry(pl, groundItems_[FindGroundItem(c)].stack.item))
@@ -1266,5 +1560,32 @@ void Game::DrawGroundItems(GamePainter& p) const
                 p.Cube(Xf(vis::kGroundItemSize, vis::kGroundItemSize, vis::kGroundItemSize,
                           ox, y, oz, 0, cx, 0, cz), ItemColor(g.stack.item));
         }
+    }
+}
+
+// ブレーキ結晶: くるくる回りながら上下に浮かぶ水色の結晶 (ボルトと同じ動き)
+void Game::DrawCrystals(GamePainter& p) const
+{
+    for (size_t i = 0; i < crystals_.size(); ++i) {
+        const float cx = (float)crystals_[i].x, cz = (float)crystals_[i].z;
+        const float phase = (float)i * anim::kBoltPhaseStep;
+        const float yaw = animTime_ * anim::kBoltSpinSpeed + phase;
+        const float baseY = vis::kCrystalBaseY + sinf(animTime_ * anim::kBoltBobSpeed + phase) * anim::kBoltBobAmp;
+        p.Sphere(Xf(vis::kBoltShadowSize, vis::kBoltShadowHeight, vis::kBoltShadowSize,
+                    0, vis::kBoltShadowY, 0, 0, cx, 0, cz), vis::kBoltShadowColor);          // 地面の影
+        p.Pyramid(Xf(vis::kCrystalSize, vis::kCrystalHeight, vis::kCrystalSize,
+                     0, baseY, 0, yaw, cx, 0, cz), vis::kCrystalColor);
+    }
+}
+
+// 爆発: 橙色の球が大きく膨らみながら、だんだん暗くなる
+void Game::DrawExplosions(GamePainter& p) const
+{
+    for (const Explosion& e : explosions_) {
+        const float t = std::min(e.age / cfg::kExplosionSeconds, 1.0f);              // 0..1
+        const float size = vis::kExplosionStartSize + (vis::kExplosionEndSize - vis::kExplosionStartSize) * t;
+        const float dim = cfg::upgrade::kBaseMultiplier - t * cfg::kHalf;           // 終わりに近づくほど暗く
+        const cfg::Rgb c = { vis::kExplosionColor.r * dim, vis::kExplosionColor.g * dim, vis::kExplosionColor.b * dim };
+        p.Sphere(Xf(size, size, size, 0, vis::kExplosionY, 0, 0, (float)e.cell.x, 0, (float)e.cell.z), c);
     }
 }

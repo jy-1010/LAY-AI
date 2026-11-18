@@ -131,6 +131,12 @@ const SfxNote kSmash[]    = { { 0.00f,    0,     0, 0.12f, Wave::Noise,    0.7f,
 const SfxNote kBuy[]      = { { 0.00f,  880,   880, 0.07f, Wave::Square,   0.5f, 12 },
                               { 0.07f, 1175,  1175, 0.07f, Wave::Square,   0.5f, 12 },
                               { 0.14f, 1568,  1568, 0.18f, Wave::Square,   0.5f,  8 } };
+const SfxNote kCollect[]  = { { 0.00f,  900,   900, 0.05f, Wave::Sine,     0.6f, 20 },
+                              { 0.05f, 1200,  1200, 0.07f, Wave::Sine,     0.6f, 16 } };
+const SfxNote kExplosion[]= { { 0.00f,    0,     0, 0.45f, Wave::Noise,    1.0f,  7 },
+                              { 0.00f,  120,    40, 0.40f, Wave::Triangle, 1.0f,  6 } };
+const SfxNote kBrakeSfx[] = { { 0.00f, 1200,   500, 0.30f, Wave::Triangle, 0.8f,  5 },
+                              { 0.10f,  700,   300, 0.30f, Wave::Sine,     0.6f,  5 } };
 const SfxNote kClear[]    = { { 0.00f,  523,   523, 0.14f, Wave::Square,   0.6f,  6 },     // ド
                               { 0.12f,  659,   659, 0.14f, Wave::Square,   0.6f,  6 },     // ミ
                               { 0.24f,  784,   784, 0.14f, Wave::Square,   0.6f,  6 },     // ソ
@@ -234,6 +240,9 @@ bool Audio::Init()
     sfxBuffers_[(int)Sfx::Drop]     = BuildSfx(kDrop);
     sfxBuffers_[(int)Sfx::Smash]    = BuildSfx(kSmash);
     sfxBuffers_[(int)Sfx::Buy]      = BuildSfx(kBuy);
+    sfxBuffers_[(int)Sfx::Collect]  = BuildSfx(kCollect);
+    sfxBuffers_[(int)Sfx::Explosion]= BuildSfx(kExplosion);
+    sfxBuffers_[(int)Sfx::Brake]    = BuildSfx(kBrakeSfx);
     sfxBuffers_[(int)Sfx::Clear]    = BuildSfx(kClear);
     sfxBuffers_[(int)Sfx::GameOver] = BuildSfx(kGameOver);
     bgmMenu_ = BuildBgm({ au::kBgmMenuBpm, kMenuMelody, sizeof(kMenuMelody), kMenuBass, sizeof(kMenuBass), false });

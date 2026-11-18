@@ -26,6 +26,9 @@ enum class Sfx {        // 効果音
     Drop,               // 持っている物を地面に置いた
     Smash,              // 隣の木・岩が壊れた
     Buy,                // ショップで強化を購入した
+    Collect,            // 自動回収車両が回収した
+    Explosion,          // ダイナマイトの爆発
+    Brake,              // ブレーキ結晶を拾った (列車が遅くなる)
     Clear,              // ステージクリア
     GameOver,           // ゲームオーバー
     Count

@@ -54,7 +54,7 @@ constexpr float kVerticalNormalThreshold = 0.5f;   // 法線の y 成分がこ�
 // ============================ ステージ =======================================
 constexpr int kMapW       = 60;            // マップの幅 (マス)。x = 0 .. kMapW-1
 constexpr int kMapH       = 15;            // マップの奥行き (マス)。z = 0 .. kMapH-1
-constexpr int kMaxPlayers = 6;             // 同時プレイ人数の上限
+constexpr int kMaxPlayers = 4;             // 同時プレイ人数の上限
 constexpr int kMaxPads    = 4;             // XInput パッドの最大接続数
 constexpr int kRailRow    = kMapH / 2;     // 線路が走る行 (z)
 constexpr int kGateHalfRows = 1;           // ゴール駅の入口 = kRailRow ± この値 (3マス幅)
@@ -122,7 +122,7 @@ constexpr float kInteractReach   = 0.9f;   // 貨車に触れる距離 (プレ�
 constexpr float kInteractPad     = 0.15f;  // 貨車に触れる判定を広げる余白
 
 // 列車の当たり判定 (プレイヤーとの衝突)
-constexpr int   kTrainCarCount = 3;        // 機関車 + 貨車2両 (後で定義する kCrafterWagonIndex + 1 と一致させる)
+constexpr int   kMaxCars       = 6;        // 追加の車両 (自動回収・採掘・ダイナマイト) を全て買った時の車両数
 constexpr float kTrainCollisionPad = 0.05f;   // 判定を車体より少し大きくする
 constexpr float kPushOutEpsilon    = 1e-4f;   // 中心が箱の内側かどうかの判定に使う微小値 (距離の2乗)
 constexpr float kPushOutMargin     = 0.02f;   // 押し出す時に余分に離す距離 (すぐ再衝突しないように)
@@ -143,16 +143,34 @@ constexpr float kGoalRushMaxSpeed = 6.0f;     // 最高速 (マス/秒)
 // ============================ ゲームバランス =================================
 constexpr float kPlayerSpeed  = 5.0f;      // プレイヤーの移動速度 (マス/秒)
 constexpr float kPlayerRadius = 0.3f;      // 当たり判定の半径
-constexpr float kTrainStartSpeed = 0.0f;  // 列車の初速 (マス/秒)
-constexpr float kTrainAccel      = 0.004f; // 列車の加速 (マス/秒 毎秒)
+constexpr float kTrainStartSpeed = 0.01f;  // 列車の初速 (マス/秒)
+constexpr float kTrainAccel      = 0.003f; // 列車の加速 (マス/秒 毎秒)
 constexpr float kTrainMaxSpeed   = 0.85f;  // 列車の最高速
 constexpr float kWagonSpacing    = 1.1f;   // 車両どうしの間隔 (線路上のマス数)
-constexpr int   kStorageWagonIndex = 1;    // 機関車から数えて何両目か (1両目 = 倉庫)
-constexpr int   kCrafterWagonIndex = 2;    //                           (2両目 = 線路の加工車)
-static_assert(kTrainCarCount == kCrafterWagonIndex + 1, "車両数と車両番号が合っていない");
 constexpr int   kWoodPerTrack    = 1;      // 線路1本に必要な木
 constexpr int   kIronPerTrack    = 1;      // 線路1本に必要な鉄
 constexpr int   kInventoryShowMax = 8;     // 貨車の上に積んで表示する最大個数
+
+// 地面の物の自動回収 (持っている物と同じ種類が近くに落ちていれば、通りがかりに勝手に拾う)
+constexpr float kAutoPickupRadius   = 0.9f;   // この距離以内に入ると拾う (プレイヤーの中心 → 山の中心)
+constexpr float kDropPickupCooldown = 1.0f;   // 置いた直後に拾い直さない時間
+
+// 列車を遅くする手段 (強化 = TRAIN BRAKE のほかに、次の 2つの出来事がある)
+constexpr float kBridgeSlowFactor   = 0.7f;   // 機関車が橋を渡っている間の速度の倍率 (橋は徐行)
+constexpr float kCrystalSlowFactor  = 0.5f;   // ブレーキ結晶を拾った後の速度の倍率
+constexpr float kCrystalSlowSeconds = 8.0f;   // その続く時間
+constexpr int   kCrystalCount       = 3;      // マップに置くブレーキ結晶の数
+
+// 追加の車両 (ショップで高額で購入。連結されると以降のステージでずっと使える)
+constexpr float kCollectInterval = 0.25f;     // 自動回収車両: 回収する間隔
+constexpr float kCollectorRadius = 3.0f;      //                回収する範囲 (車両の中心から)
+constexpr float kMineInterval    = 1.5f;      // 周囲採掘車両: 1本・1個 採掘する間隔
+constexpr float kMinerRadius     = 3.0f;      //                採掘する範囲
+constexpr int   kDynamiteWood     = 1;        // ダイナマイト作成車両: 1本に必要な 木
+constexpr int   kDynamiteIron     = 2;        //                        1本に必要な 鉄
+constexpr float kDynamiteSeconds  = 5.0f;     //                        1本を作る時間
+constexpr int   kDynamiteCapacity = 4;        //                        溜められる本数
+constexpr float kExplosionSeconds = 0.4f;     // 爆発の演出の長さ
 
 // アップグレード (ステージクリア後にボルトで購入。購入すると 全員のプレイヤー / 列車 に効く)
 namespace upgrade {
@@ -164,13 +182,15 @@ constexpr float kSmashChanceStep   = 0.12f;  // プレイヤー: 採取した物
 constexpr float kCraftSpeedStep    = 0.25f;  // 列車: 線路を作る速さ +25% / レベル
 constexpr int   kTrackCapacityStep = 2;      // 列車: 線路の積載量 +2 / レベル
 constexpr int   kCargoCapacityStep = 10;     // 列車: 貨物の積載量 +10 / レベル (木・鉄それぞれ)
+constexpr float kBrakeStep         = 0.08f;  // 列車: 速度 -8% / レベル
+constexpr float kBrakeMinFactor    = 0.5f;   // 列車: ブレーキでも これ以下には遅くならない
 }
 
 // プレイヤーの出現位置 (参加順)
-inline constexpr Vec2f kSpawn[kMaxPlayers] = { { 8, 5 },{ 7, 5 },{ 8, 4 },{ 7, 4 } ,{ 7, 3 },{ 8, 3 } };
-// プレイヤーの色 (青・赤・緑・黄・ 紫・黒)
+inline constexpr Vec2f kSpawn[kMaxPlayers] = { {8, 5}, {7, 5}, {8, 4}, {7, 4} };
+// プレイヤーの色 (青・赤・緑・黄)
 inline constexpr Rgb kPlayerColors[kMaxPlayers] = {
-    { 0.20f, 0.45f, 0.90f }, { 0.90f, 0.30f, 0.30f }, { 0.30f, 0.80f, 0.35f }, { 0.95f, 0.80f, 0.20f },{ 0.95f, 0.30f, 0.90f },{ 0.05f, 0.05f, 0.05 }
+    { 0.20f, 0.45f, 0.90f }, { 0.90f, 0.30f, 0.30f }, { 0.30f, 0.80f, 0.35f }, { 0.95f, 0.80f, 0.20f },
 };
 
 // ============================ カメラ =========================================
@@ -192,6 +212,8 @@ constexpr float kBoltSpinSpeed = 2.5f;     // ボルトの回転速度 (rad/秒)
 constexpr float kBoltBobSpeed  = 3.0f;     // ボルトの上下運動の速さ
 constexpr float kBoltBobAmp    = 0.12f;    // ボルトの上下運動の幅
 constexpr float kBoltPhaseStep = 0.8f;     // ボルトごとの位相ずらし (動きをそろえない)
+constexpr float kMagnetSpinSpeed = 3.0f;    // 自動回収車両の磁石の回転 (rad/秒)
+constexpr float kDrillSpinSpeed  = 4.0f;    // 採掘車両のドリルの回転 (rad/秒)
 constexpr float kFlagSwaySpeed = 2.0f;     // 旗のなびく速さ
 constexpr float kFlagSwayAmp   = 0.25f;    // 旗のなびく角度 (rad)
 }
@@ -302,6 +324,24 @@ constexpr float kCraftBarLength   = 0.80f;     // 満タンの長さ
 constexpr float kCraftBarZ0       = -0.40f;    // バーの始まり (車両の後ろ側)
 constexpr Rgb   kCraftBarColor    = { 0.30f, 1.00f, 0.50f };
 constexpr Rgb   kCraftBarBgColor  = { 0.10f, 0.25f, 0.28f };
+// --- 追加の車両 ---
+constexpr Rgb   kCollectorWagonColor = { 0.90f, 0.55f, 0.15f };    // 自動回収: オレンジ (上で磁石が回る)
+constexpr Rgb   kMinerWagonColor     = { 0.45f, 0.48f, 0.55f };    // 周囲採掘: 灰色 (上でドリルが回る)
+constexpr Rgb   kDynamiteWagonColor  = { 0.60f, 0.15f, 0.15f };    // ダイナマイト作成: 暗い赤
+constexpr float kMagnetSize = 0.45f, kMagnetHeight = 0.10f, kMagnetY = 0.68f;     // 磁石 (六角の円盤)
+constexpr Rgb   kMagnetColor = { 0.85f, 0.85f, 0.95f };
+constexpr float kDrillSize = 0.30f, kDrillHeight = 0.45f, kDrillY = 0.82f;        // ドリル (四角錐)
+constexpr Rgb   kDrillColor = { 0.95f, 0.85f, 0.30f };
+constexpr float kDynamiteStickWidth = 0.12f, kDynamiteStickLength = 0.20f;        // ダイナマイトの束 (貨車の上に並べる)
+constexpr float kDynamiteStickY = 0.66f, kDynamiteStickOffsetX = 0.10f;
+constexpr float kDynamiteStickStep = 0.20f;       // 束を並べる間隔 (車両の前後方向)
+constexpr Rgb   kDynamiteColor = { 0.90f, 0.15f, 0.15f };
+// --- ブレーキ結晶 (拾うと列車が一時的に遅くなる) ---
+constexpr float kCrystalBaseY = 0.55f, kCrystalSize = 0.30f, kCrystalHeight = 0.50f;
+constexpr Rgb   kCrystalColor = { 0.35f, 0.90f, 1.00f };
+// --- 爆発 (ダイナマイト) ---
+constexpr float kExplosionStartSize = 0.6f, kExplosionEndSize = 2.6f, kExplosionY = 0.5f;
+constexpr Rgb   kExplosionColor = { 1.00f, 0.60f, 0.15f };
 // --- プレイヤーが持っている物 (頭の上に積んで表示) ---
 constexpr float kHeldItemSize  = 0.24f;        // 木・鉄の立方体
 constexpr float kHeldItemStep  = 0.20f;        // 積む間隔
@@ -435,6 +475,7 @@ constexpr Rgb kColorGray  = { 0.80f, 0.85f, 0.90f };
 constexpr Rgb kColorRed   = { 1.00f, 0.35f, 0.30f };
 constexpr Rgb kColorGreen = { 0.55f, 1.00f, 0.55f };
 constexpr Rgb kColorBarOff = { 0.25f, 0.28f, 0.32f };  // 音量バーの空きマス
+constexpr Rgb kColorCyan   = { 0.45f, 0.95f, 1.00f };  // 列車が遅くなっている表示
 // 暗幕の色 (a = 濃さ)
 constexpr Rgba kTitleDim = { 0.00f, 0.00f, 0.00f, 0.45f };
 constexpr Rgba kClearDim = { 0.00f, 0.12f, 0.04f, 0.55f };
@@ -459,7 +500,8 @@ constexpr float kTitleHint1Y = 600, kTitleHint2Y = 635, kTitleHintPx = 3;
 constexpr float kHudX = 20;
 constexpr float kHudLine1Y = 16, kHudLine1Px = 4;
 constexpr float kHudLine2Y = 52, kHudLine2Px = 3;
-constexpr float kHudPlayerTopY = 100;      // プレイヤーごとの「持ち物」表示の1行目
+constexpr float kHudLine3Y = 80, kHudLine3Px = 3;     // 列車の状態 (減速中・ダイナマイトの本数)
+constexpr float kHudPlayerTopY = 112;      // プレイヤーごとの「持ち物」表示の1行目
 constexpr float kHudPlayerStep = 30, kHudPlayerPx = 3;
 constexpr float kHudSwatchSize = 18, kHudSwatchGap = 10;   // 色見本の四角の大きさ / 文字との間隔
 constexpr float kHudBottomMargin = 36;
@@ -480,15 +522,22 @@ constexpr float kMenuTopY = 380, kMenuStep = 64, kMenuPx = 5;       // タイト
 constexpr float kPauseTitleY = 130, kPauseTitlePx = 12;             // 「PAUSED」
 constexpr float kPauseMenuTopY = 290;                               // ポーズのメニュー (間隔・大きさは kMenuStep / kMenuPx)
 constexpr float kPauseHintY = 600, kHintPx = 3;                     // 操作ヒント
-// 強化ショップ
-constexpr float kShopTitleY = 40, kShopTitlePx = 9;
-constexpr float kShopBoltsY = 120, kShopBoltsPx = 5;
-constexpr float kShopTopY = 170, kShopRowStep = 40;
-constexpr float kShopTextPx = 4, kShopHeaderPx = 3;
-constexpr float kShopPanelWidth = 900;                              // 項目を並べる幅 (画面中央に置く)
-constexpr float kShopBarOffset = 360, kShopCostOffset = 640;        // 左端から レベルバー / 値段 までの距離
-constexpr float kShopCellW = 22, kShopCellH = 22, kShopCellGap = 6; // レベルバーの1マス
-constexpr float kShopDescY = 630, kShopHintY = 675;
+// 強化ショップ (プレイヤー / 列車 / 車両 の3区分。項目が多いので小さめの文字)
+constexpr float kShopTitleY = 28, kShopTitlePx = 8;
+constexpr float kShopBoltsY = 92, kShopBoltsPx = 5;
+constexpr float kShopTopY = 140, kShopRowStep = 26;
+constexpr float kShopTextPx = 3, kShopHeaderPx = 3;
+constexpr float kShopPanelWidth = 860;                              // 項目を並べる幅 (画面中央に置く)
+constexpr float kShopBarOffset = 300, kShopCostOffset = 560;        // 左端から レベルバー / 値段 までの距離
+constexpr float kShopCellW = 18, kShopCellH = 18, kShopCellGap = 5; // レベルバーの1マス
+constexpr float kShopDescY = 605, kShopHintY = 655;
+// キーコンフィグ画面
+constexpr float kKeyTitleY = 40, kKeyTitlePx = 9;
+constexpr float kKeyTabY = 130, kKeyTabPx = 4, kKeyTabGap = 40;     // 「KEYBOARD 1 / KEYBOARD 2 / GAMEPAD」の切替
+constexpr float kKeyRowTopY = 210, kKeyRowStep = 46, kKeyTextPx = 4;
+constexpr float kKeyPanelWidth = 760, kKeyValueOffset = 400;        // 項目を並べる幅 / 左端からキー名までの距離
+constexpr float kKeyMessageY = 590, kKeyHintY = 650;
+constexpr float kKeyMessageSeconds = 1.5f;                          // 「そのキーは使えません」を出しておく時間
 // 設定画面
 constexpr float kSettingsTitleY = 60, kSettingsTitlePx = 10;
 constexpr float kSettingsTopY = 190, kSettingsRowStep = 58, kSettingsTextPx = 4;

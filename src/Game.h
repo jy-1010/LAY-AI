@@ -11,7 +11,11 @@
 //   - 木・岩を採取して持つ → 貨物車両に預ける → レール作成車両が 木 + 鉄 から線路を作る
 //     → 線路を取り出して持つ → 線路の先端に置く
 //   - 持っている物は地面に置ける。地面の物は採取ボタンで拾える
-//   - ステージクリア後のショップで、ボルトを使ってプレイヤー / 列車を強化できる
+//   - ステージクリア後のショップで、ボルトを使ってプレイヤー / 列車を強化したり、車両を買い足せる
+//       車両: 自動回収 (近くの落とし物とボルトを集める) / 周囲採掘 (近くの木・岩を掘る) /
+//             ダイナマイト作成 (壊れない岩を爆破できるダイナマイトを作る)
+//   - 列車を遅くする手段: TRAIN BRAKE の強化 / ブレーキ結晶を拾う (一時的) / 橋の上は徐行
+//   - 持っている物と同じ物が近くの地面に落ちていれば、通りがかりに自動で拾う
 //   - 走り続ける列車の前に線路を敷き続ける。線路が途切れたらゲームオーバー
 //   - 右端のゴール駅の入口まで線路を繋げばクリア → 次のステージへ (だんだん難しくなる)
 //   - ステージ: 木 / 岩 / 壊れない岩の塊 / 水(木を持っていれば橋を架けられる) / 駅 / ボルト(拾うとスコア)
@@ -28,7 +32,10 @@ struct Input {                      // 1人ぶんの入力 (キーボード/パ�
 struct IVec2 { int x = 0, z = 0; }; // マス座標
 
 // プレイヤーが持てる物
-enum class Item { None, Wood, Iron, Track };
+enum class Item { None, Wood, Iron, Track, Dynamite };
+
+// 列車の車両の種類 (先頭 = 機関車)。最初は 機関車 + 貨物 + レール作成 の3両で、残りはショップで買って連結する
+enum class Wagon { Engine, Cargo, Crafter, Collector, Miner, Dynamite };
 struct HeldItem {                   // 持っている物 (1種類だけ。count 個)
     Item item  = Item::None;
     int  count = 0;
@@ -60,6 +67,9 @@ enum class GameEvent {
     Deny,           // できない操作 (手がふさがっている・材料が無い など)
     Drop,           // 持っている物を地面に置いた
     Smash,          // 採取の巻き添えで隣の木・岩が壊れた
+    Collect,        // 自動回収車両が回収した
+    Explosion,      // ダイナマイトが爆発した
+    BrakeCrystal,   // ブレーキ結晶を拾った (列車が一時的に遅くなる)
     Pushed,         // 列車に押された (押され始めた時だけ)
     Respawn,        // 挟まれてリスポーンした
     RushStart,      // ゴールラッシュが始まった
@@ -80,7 +90,12 @@ public:
         IVec2    cell;
         HeldItem stack;
     };
+    struct Explosion {                      // 爆発の演出 (age が kExplosionSeconds になるまで)
+        IVec2 cell;
+        float age = 0;
+    };
     struct CarBox {                         // 列車の車両 1両ぶんの当たり判定 (向き付きの箱)
+        Wagon type = Wagon::Engine;         // 車両の種類
         float x = 0, z = 0, yaw = 0;        // 中心の位置と向き
         float halfW = 0, halfL = 0;         // 幅・長さの半分 (判定の余白を含む)
     };
@@ -125,8 +140,14 @@ public:
     float CraftSeconds() const;                          // 線路を1本作る時間
     int   CrafterCapacity() const;                       // レール作成車両の線路の積載量
     int   CargoCapacity() const;                         // 貨物車両の積載量 (木・鉄それぞれ)
+    float BrakeMultiplier() const;                       // TRAIN BRAKE による速度の倍率 (1 = 強化なし)
     float TrainSpeed() const;               // 今の列車の速さ (ゴールラッシュ中は加速した値)
     bool  IsRushing() const;                // 線路がゴールまで繋がり、列車が全速力で向かっているか
+    float SlowSeconds() const { return slowTimer_; }     // ブレーキ結晶で遅くなっている残り時間 (0 = 遅くなっていない)
+    bool  OnBridge() const;                 // 機関車が橋を渡っている (徐行中)
+    bool  HasWagon(Wagon w) const;          // その車両が連結されているか
+    int   DynamiteStock() const { return dynamiteStock_; }   // ダイナマイト作成車両にある本数
+    float DynamiteProgress() const;         // ダイナマイトを作っている途中の進み具合 0..1
     void  SetCameraX(float x) { camX_ = x; }             // タイトルのデモ表示用
 
     // 前回から起きた出来事を受け取る (受け取ると空になる)
@@ -139,10 +160,12 @@ private:
         IVec2 face{ 1, 0 };                 // 向き
         bool  pushed = false;               // 前のフレームで列車に押されていたか (押され始めの検出用)
         HeldItem held;                      // 持っている物
+        float noPickupTimer = 0;            // 置いた直後は自動で拾い直さない (残り時間)
     };
 
     // --- ステージ生成 ---
     void StartStage(uint32_t seed);         // 現在の stage_ でステージを作って開始状態にする
+    void RebuildTrain();                    // 買った車両に合わせて train_ を作り直す
     void Emit(GameEvent e) { events_.push_back(e); }
     uint32_t Rand();
     float    Rand01();                      // 0 以上 1 未満の乱数
@@ -154,6 +177,7 @@ private:
     bool GoalReachable() const;             // 線路の先端からゴール駅の入口まで行けるか (水は橋で渡れる扱い)
     void ScatterResources();                // 木と岩
     void ScatterBolts();
+    void ScatterCrystals();                 // ブレーキ結晶を置く
     static bool IsGateRow(int z);           // ゴール駅の入口の行か
     bool IsGoal(IVec2 c) const;             // ゴール駅の入口のマスか
 
@@ -172,6 +196,9 @@ private:
     int  FacedWagon(const Player& p) const;          // 向いている先の貨車 (貨物 / レール作成)。無ければ 0
     void DepositToCargo(Player& p);                  // 持っている木・鉄を貨物車両に預ける
     void TakeTracks(Player& p);                      // レール作成車両から線路を取り出す
+    void TakeDynamite(Player& p);                    // ダイナマイト作成車両からダイナマイトを取り出す
+    void Explode(IVec2 c);                           // ダイナマイトを爆発させる (壊れない岩を壊す)
+    void AutoPickup(Player& p);                      // 持っている物と同じ種類が近くに落ちていれば自動で拾う
     void HarvestFacing(Player& p);                   // 向いているマスの 落ちている物 / 木・岩 を拾う
     void DropHeld(Player& p);                        // 持っている物を向いているマスの地面に置く
 
@@ -183,11 +210,16 @@ private:
     void PlaceFacing(Player& p);                     // 向いているマスに橋を架ける / 線路を置く
     int  StageRailScore() const;
     void TrainPoint(float t, float& x, float& z, float& yaw) const;
-    void GetCars(CarBox cars[cfg::kTrainCarCount]) const;
+    float BaseSpeed() const;                // 列車の通常の速さ (加速 + ブレーキ強化 + 結晶 + 橋の徐行を反映)
+    void UpdateWagons(float dt);            // 追加車両の自動動作
+    void RunCollector(const CarBox& car, float dt);
+    void RunMiner(const CarBox& car, float dt);
+    void RunDynamiteCrafter(float dt);
+    int  GetCars(CarBox cars[cfg::kMaxCars]) const;      // 全車両の判定用の箱を作る (戻り値 = 車両数)
     void ResolveTrainCollisions();          // プレイヤーを車両の外へ押し出す
-    const CarBox* FirstCarOverlap(const CarBox cars[cfg::kTrainCarCount], float x, float z, float radius) const;
+    const CarBox* FirstCarOverlap(const CarBox* cars, int count, float x, float z, float radius) const;
     void RespawnPlayer(int idx);            // 挟まれて逃げ場が無い時: マルチ=他のプレイヤーの近く / ソロ=列車の近く
-    bool PickRespawnSpot(const CarBox cars[cfg::kTrainCarCount], float cx, float cz,
+    bool PickRespawnSpot(const CarBox* cars, int count, float cx, float cz,
                          float minDist, float maxDist, float& outX, float& outZ);
 
     // --- 描画 ---
@@ -198,16 +230,25 @@ private:
     void DrawTrain(GamePainter& p) const;
     void DrawPlayers(GamePainter& p) const;
     void DrawGroundItems(GamePainter& p) const;
+    void DrawCrystals(GamePainter& p) const;
+    void DrawExplosions(GamePainter& p) const;
 
     Tile  map_[H][W] = {};
     bool  onPath_[H][W] = {};
     std::vector<IVec2> path_;           // 線路のセル列 (列車はこの上を進む)
     std::vector<IVec2> boltItems_;      // まだ拾われていないボルトの位置
+    std::vector<IVec2> crystals_;       // まだ拾われていないブレーキ結晶の位置
+    std::vector<Explosion> explosions_; // 爆発の演出中のもの
+    std::vector<Wagon> train_;          // 連結されている車両 (先頭 = 機関車)
 
     Player players_[MaxPlayers];
     int   cargoWood_ = 0, cargoIron_ = 0;            // 貨物車両の中身 (チーム共有)
     int   crafterTracks_ = 0;                        // レール作成車両にある線路
     float craftTimer_ = 0;                           // 線路を1本作るまでの経過時間
+    int   dynamiteStock_ = 0;                        // ダイナマイト作成車両にあるダイナマイト
+    float dynamiteTimer_ = 0;                        // ダイナマイトを1本作るまでの経過時間
+    float collectTimer_ = 0, mineTimer_ = 0;         // 自動回収車両 / 採掘車両の動作間隔の計時
+    float slowTimer_ = 0;                            // ブレーキ結晶の効果の残り時間
     int   bolts_ = 0;                                // 使えるボルト (チーム共有。ショップで消費する)
     int   boltsCollected_ = 0;                       // これまでに拾ったボルトの総数 (スコア用。消費しても減らない)
     std::vector<GroundItem> groundItems_;            // 地面に落ちている物
@@ -219,6 +260,7 @@ private:
     int   boltsAtStageStart_ = 0;       // やり直し用: ステージ開始時の状態 (ボルト・貨物・持ち物)
     int   boltsCollectedAtStageStart_ = 0;
     int   cargoWoodAtStageStart_ = 0, cargoIronAtStageStart_ = 0;
+    int   dynamiteAtStageStart_ = 0;
     HeldItem heldAtStageStart_[MaxPlayers];
     int   pondCount_ = 0, boulderClusters_ = 0;      // このステージの池・岩の塊の数
     float trainStartSpeed_ = 0, trainMaxSpeed_ = 0;  // このステージの列車の速度

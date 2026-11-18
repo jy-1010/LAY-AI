@@ -6,8 +6,8 @@ if(MSVC)
 endif()
 
 add_executable(UnrailedDX11 WIN32
-    src/main.cpp src/Renderer.cpp src/App.cpp src/Ui.cpp src/Game.cpp src/Input.cpp src/Settings.cpp src/Audio.cpp src/ObjLoader.cpp
-    src/Renderer.h src/Config.h src/MeshGen.h src/App.h src/Ui.h src/Game.h src/Input.h src/Settings.h src/Upgrade.h src/Audio.h src/Mesh.h src/MeshGen.h)
+    src/main.cpp src/Renderer.cpp src/App.cpp src/Ui.cpp src/Game.cpp src/Input.cpp src/Settings.cpp src/KeyBindings.cpp src/Audio.cpp src/ObjLoader.cpp
+    src/Renderer.h src/Config.h src/MeshGen.h src/App.h src/Ui.h src/Game.h src/Input.h src/Settings.h src/KeyBindings.h src/Upgrade.h src/Audio.h src/Mesh.h src/MeshGen.h)
 target_link_libraries(UnrailedDX11 PRIVATE d3d11 d3dcompiler user32 xinput xaudio2 ole32)
 
 add_custom_command(TARGET UnrailedDX11 POST_BUILD

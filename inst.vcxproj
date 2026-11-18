@@ -143,6 +143,7 @@
     <ClCompile Include="src\Audio.cpp" />
     <ClCompile Include="src\Game.cpp" />
     <ClCompile Include="src\Input.cpp" />
+    <ClCompile Include="src\KeyBindings.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\ObjLoader.cpp" />
     <ClCompile Include="src\Renderer.cpp" />
@@ -155,6 +156,7 @@
     <ClInclude Include="src\Config.h" />
     <ClInclude Include="src\Game.h" />
     <ClInclude Include="src\Input.h" />
+    <ClInclude Include="src\KeyBindings.h" />
     <ClInclude Include="src\Mesh.h" />
     <ClInclude Include="src\MeshGen.h" />
     <ClInclude Include="src\Renderer.h" />
